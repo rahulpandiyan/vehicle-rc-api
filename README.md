@@ -261,7 +261,7 @@ Single lookups return:
       "name": "TEST OWNER",
       "serial": "Second Owner",
       "phone": "(+91)00000 00000",
-      "address": "BENGALURU ..."
+      "address": "EXAMPLE ADDRESS, MAHARASHTRA"
     },
     "vehicle": {
       "maker": "HONDA MOTORCYCLE & SCOOTER INDIA",
