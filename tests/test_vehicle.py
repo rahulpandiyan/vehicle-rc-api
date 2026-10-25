@@ -40,7 +40,7 @@ class ApiTests(unittest.TestCase):
     def test_lookup_success(self):
         with mock.patch.object(Vehicle, "vahanx_lookup", return_value=SAMPLE):
             response = self.client.get(
-                "/vehicle?key=Vehicle-key_s0undw4v3&query=MH12AB1234&cache=no"
+                "/vehicle?query=MH12AB1234&cache=no"
             )
         self.assertEqual(response.status_code, 200)
         data = response.get_json()
@@ -54,7 +54,7 @@ class ApiTests(unittest.TestCase):
     def test_plate_is_normalized(self):
         with mock.patch.object(Vehicle, "vahanx_lookup", return_value=SAMPLE) as lookup:
             response = self.client.get(
-                "/vehicle?key=Vehicle-key_s0undw4v3&query=mh-12-ab-1234&cache=no"
+                "/vehicle?query=mh-12-ab-1234&cache=no"
             )
         self.assertEqual(response.status_code, 200)
         lookup.assert_called_once_with("MH12AB1234")
@@ -62,7 +62,7 @@ class ApiTests(unittest.TestCase):
     def test_alias_parameter_works(self):
         with mock.patch.object(Vehicle, "vahanx_lookup", return_value=SAMPLE):
             response = self.client.get(
-                "/vehicle?key=Vehicle-key_s0undw4v3&number=MH12AB1234&cache=no"
+                "/vehicle?number=MH12AB1234&cache=no"
             )
         self.assertEqual(response.status_code, 200)
 
@@ -72,7 +72,7 @@ class ApiTests(unittest.TestCase):
             side_effect=Vehicle.VehicleNotFound("VahanX has no record for DL01AB1234"),
         ):
             response = self.client.get(
-                "/vehicle?key=Vehicle-key_s0undw4v3&query=DL01AB1234&cache=no"
+                "/vehicle?query=DL01AB1234&cache=no"
             )
         self.assertEqual(response.status_code, 404)
         data = response.get_json()
@@ -84,20 +84,31 @@ class ApiTests(unittest.TestCase):
             Vehicle, "vahanx_lookup", side_effect=RuntimeError("boom")
         ):
             response = self.client.get(
-                "/vehicle?key=Vehicle-key_s0undw4v3&query=MH12AB1234&cache=no"
+                "/vehicle?query=MH12AB1234&cache=no"
             )
         self.assertEqual(response.status_code, 502)
         data = response.get_json()
         self.assertFalse(data["found"])
         self.assertEqual(data["error"], "Vehicle lookup failed")
 
-    def test_missing_key_returns_401(self):
-        response = self.client.get("/vehicle?query=MH12AB1234")
+    def test_lookup_without_key_succeeds_when_open(self):
+        with mock.patch.object(Vehicle, "AUTH_REQUIRED", False), mock.patch.object(
+            Vehicle, "vahanx_lookup", return_value=SAMPLE
+        ):
+            response = self.client.get("/vehicle?query=MH12AB1234&cache=no")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["Registration_Number"], "MH12AB1234")
+
+    def test_legacy_lookup_requires_key_when_enabled(self):
+        with mock.patch.object(Vehicle, "AUTH_REQUIRED", True), mock.patch.object(
+            Vehicle, "VALID_API_KEYS", {"test-key"}
+        ):
+            response = self.client.get("/vehicle?query=MH12AB1234")
         self.assertEqual(response.status_code, 401)
 
     def test_invalid_registration_returns_400(self):
         response = self.client.get(
-            "/vehicle?key=Vehicle-key_s0undw4v3&query=NOT-A-PLATE"
+            "/vehicle?query=NOT-A-PLATE"
         )
         self.assertEqual(response.status_code, 400)
 
@@ -124,8 +135,6 @@ class ApiTests(unittest.TestCase):
 
 
 class V1ApiTests(unittest.TestCase):
-    AUTH = {"X-API-KEY": "Vehicle-key_s0undw4v3"}
-
     def setUp(self):
         Vehicle._cache.clear()
         self.client = Vehicle.app.test_client()
@@ -136,7 +145,7 @@ class V1ApiTests(unittest.TestCase):
     def test_path_lookup_returns_grouped_payload(self):
         with mock.patch.object(Vehicle, "vahanx_lookup", return_value=SAMPLE):
             response = self.client.get(
-                "/api/v1/vehicle/mh-12-ab-1234?cache=no", headers=self.AUTH
+                "/api/v1/vehicle/mh-12-ab-1234?cache=no"
             )
         self.assertEqual(response.status_code, 200)
         data = response.get_json()
@@ -151,48 +160,39 @@ class V1ApiTests(unittest.TestCase):
         self.assertIn("request_id", data["meta"])
         self.assertNotIn("Owner_Name", data["data"])
 
-    def test_query_lookup_with_bearer_token(self):
-        with mock.patch.object(Vehicle, "vahanx_lookup", return_value=SAMPLE):
-            response = self.client.get(
-                "/api/v1/vehicle?registration=MH12AB1234&cache=no",
-                headers={"Authorization": "Bearer Vehicle-key_s0undw4v3"},
-            )
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.get_json()["data"]["owner"]["name"], "TEST OWNER")
-
     def test_post_lookup_with_json(self):
         with mock.patch.object(Vehicle, "vahanx_lookup", return_value=SAMPLE):
             response = self.client.post(
                 "/api/v1/vehicle",
                 json={"registration": "MH12AB1234", "cache": "no"},
-                headers=self.AUTH,
             )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["data"]["registration_number"], "MH12AB1234")
 
     def test_cached_flag_is_reported(self):
         with mock.patch.object(Vehicle, "vahanx_lookup", return_value=SAMPLE):
-            self.client.get("/api/v1/vehicle/MH12AB1234", headers=self.AUTH)
-            response = self.client.get("/api/v1/vehicle/MH12AB1234", headers=self.AUTH)
+            self.client.get("/api/v1/vehicle/MH12AB1234")
+            response = self.client.get("/api/v1/vehicle/MH12AB1234")
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.get_json()["meta"]["cached"])
 
-    def test_missing_key_returns_401_envelope(self):
-        response = self.client.get("/api/v1/vehicle/MH12AB1234")
-        self.assertEqual(response.status_code, 401)
-        data = response.get_json()
-        self.assertEqual(data["status"], "error")
-        self.assertEqual(data["error"]["code"], "UNAUTHORIZED")
+    def test_lookup_without_key_succeeds_when_open(self):
+        with mock.patch.object(Vehicle, "AUTH_REQUIRED", False), mock.patch.object(
+            Vehicle, "vahanx_lookup", return_value=SAMPLE
+        ):
+            response = self.client.get("/api/v1/vehicle/MH12AB1234")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["status"], "success")
 
     def test_invalid_registration_returns_400_envelope(self):
         response = self.client.get(
-            "/api/v1/vehicle?registration=NOT-A-PLATE", headers=self.AUTH
+            "/api/v1/vehicle?registration=NOT-A-PLATE"
         )
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.get_json()["error"]["code"], "INVALID_REGISTRATION")
 
     def test_missing_registration_returns_400(self):
-        response = self.client.get("/api/v1/vehicle", headers=self.AUTH)
+        response = self.client.get("/api/v1/vehicle")
         self.assertEqual(response.status_code, 400)
         self.assertEqual(
             response.get_json()["error"]["code"], "MISSING_REGISTRATION"
@@ -204,7 +204,7 @@ class V1ApiTests(unittest.TestCase):
             side_effect=Vehicle.VehicleNotFound("no record"),
         ):
             response = self.client.get(
-                "/api/v1/vehicle/DL01AB1234?cache=no", headers=self.AUTH
+                "/api/v1/vehicle/DL01AB1234?cache=no"
             )
         self.assertEqual(response.status_code, 404)
         data = response.get_json()
@@ -216,7 +216,7 @@ class V1ApiTests(unittest.TestCase):
             Vehicle, "vahanx_lookup", side_effect=RuntimeError("boom")
         ):
             response = self.client.get(
-                "/api/v1/vehicle/MH12AB1234?cache=no", headers=self.AUTH
+                "/api/v1/vehicle/MH12AB1234?cache=no"
             )
         self.assertEqual(response.status_code, 502)
         self.assertEqual(
@@ -229,67 +229,32 @@ class V1ApiTests(unittest.TestCase):
             side_effect=Vehicle.VahanxRateLimited("slow down"),
         ):
             response = self.client.get(
-                "/api/v1/vehicle/MH12AB1234?cache=no", headers=self.AUTH
+                "/api/v1/vehicle/MH12AB1234?cache=no"
             )
         self.assertEqual(response.status_code, 429)
         self.assertEqual(
             response.get_json()["error"]["code"], "UPSTREAM_RATE_LIMITED"
         )
-        self.assertEqual(response.headers["Retry-After"], "30")
+        self.assertEqual(response.headers["Retry-After"], "60")
 
-    def test_batch_returns_per_item_results(self):
-        def fake_lookup(number):
-            if number == "DL01AB1234":
-                raise Vehicle.VehicleNotFound("no record")
-            result = dict(SAMPLE)
-            result["Registration_Number"] = number
-            return result
-
-        with mock.patch.object(Vehicle, "vahanx_lookup", side_effect=fake_lookup):
-            response = self.client.post(
-                "/api/v1/vehicles/batch",
-                json={"registrations": ["MH12AB1234", "DL01AB1234"]},
-                headers=self.AUTH,
+    def test_upstream_retry_after_is_honoured(self):
+        with mock.patch.object(
+            Vehicle, "vahanx_lookup",
+            side_effect=Vehicle.VahanxRateLimited("slow down", retry_after="120"),
+        ):
+            response = self.client.get(
+                "/api/v1/vehicle/MH12AB1234?cache=no"
             )
-        self.assertEqual(response.status_code, 200)
-        data = response.get_json()
-        self.assertEqual(data["status"], "partial")
-        self.assertEqual(data["count"], 2)
-        self.assertEqual(data["succeeded"], 1)
-        self.assertEqual(data["failed"], 1)
-        self.assertEqual(data["results"][0]["status"], "success")
-        self.assertEqual(
-            data["results"][1]["error"]["code"], "VEHICLE_NOT_FOUND"
-        )
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(response.headers["Retry-After"], "120")
 
-    def test_batch_rejects_too_many_items(self):
+    def test_batch_endpoint_is_not_available(self):
         response = self.client.post(
             "/api/v1/vehicles/batch",
-            json={"registrations": ["MH12AB1234"] * (Vehicle.BATCH_MAX + 1)},
-            headers=self.AUTH,
+            json={"registrations": ["MH12AB1234", "DL01AB1234"]},
         )
-        self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.get_json()["error"]["code"], "BATCH_TOO_LARGE")
-
-    def test_batch_accepts_a_single_string(self):
-        with mock.patch.object(Vehicle, "vahanx_lookup", return_value=SAMPLE):
-            response = self.client.post(
-                "/api/v1/vehicles/batch",
-                json={"registrations": "MH12AB1234"},
-                headers=self.AUTH,
-            )
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.get_json()["count"], 1)
-
-    def test_batch_rejects_invalid_body(self):
-        response = self.client.post(
-            "/api/v1/vehicles/batch", json={"registrations": 123},
-            headers=self.AUTH,
-        )
-        self.assertEqual(response.status_code, 400)
-        self.assertEqual(
-            response.get_json()["error"]["code"], "MISSING_REGISTRATIONS"
-        )
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.get_json()["error"]["code"], "NOT_FOUND")
 
     def test_v1_health_is_public(self):
         response = self.client.get("/api/v1/health")
@@ -305,6 +270,10 @@ class V1ApiTests(unittest.TestCase):
         self.assertEqual(spec["openapi"], "3.1.0")
         self.assertIn("/api/v1/vehicle/{registration}", spec["paths"])
         self.assertIn("ApiKeyAuth", spec["components"]["securitySchemes"])
+        # With protection off, the spec advertises keyless access.
+        with mock.patch.object(Vehicle, "AUTH_REQUIRED", False):
+            open_spec = self.client.get("/api/v1/openapi.json").get_json()
+        self.assertIn({}, open_spec["security"])
 
     def test_unknown_api_route_returns_json(self):
         response = self.client.get("/api/v1/nope")
@@ -315,6 +284,69 @@ class V1ApiTests(unittest.TestCase):
         response = self.client.get("/api/v1/health")
         self.assertEqual(response.headers["Access-Control-Allow-Origin"], "*")
         self.assertIn("X-Request-ID", response.headers)
+
+
+class AuthRequiredTests(unittest.TestCase):
+    """Optional API-key protection (API_KEY set or REQUIRE_API_KEY=1)."""
+
+    KEY = "test-secret-key"
+
+    def setUp(self):
+        Vehicle._cache.clear()
+        self.client = Vehicle.app.test_client()
+        auth = mock.patch.multiple(
+            Vehicle, AUTH_REQUIRED=True, VALID_API_KEYS={self.KEY}
+        )
+        auth.start()
+        self.addCleanup(auth.stop)
+
+    def tearDown(self):
+        Vehicle._cache.clear()
+
+    def test_missing_key_returns_401_envelope(self):
+        response = self.client.get("/api/v1/vehicle/MH12AB1234")
+        self.assertEqual(response.status_code, 401)
+        data = response.get_json()
+        self.assertEqual(data["status"], "error")
+        self.assertEqual(data["error"]["code"], "UNAUTHORIZED")
+
+    def test_header_key_is_accepted(self):
+        with mock.patch.object(Vehicle, "vahanx_lookup", return_value=SAMPLE):
+            response = self.client.get(
+                "/api/v1/vehicle/MH12AB1234",
+                headers={"X-API-KEY": self.KEY},
+            )
+        self.assertEqual(response.status_code, 200)
+
+    def test_bearer_key_is_accepted(self):
+        with mock.patch.object(Vehicle, "vahanx_lookup", return_value=SAMPLE):
+            response = self.client.get(
+                "/api/v1/vehicle?registration=MH12AB1234",
+                headers={"Authorization": f"Bearer {self.KEY}"},
+            )
+        self.assertEqual(response.status_code, 200)
+
+    def test_query_key_is_accepted(self):
+        with mock.patch.object(Vehicle, "vahanx_lookup", return_value=SAMPLE):
+            response = self.client.get(f"/api/v1/vehicle/MH12AB1234?key={self.KEY}")
+        self.assertEqual(response.status_code, 200)
+
+    def test_wrong_key_is_rejected(self):
+        response = self.client.get(
+            "/api/v1/vehicle/MH12AB1234", headers={"X-API-KEY": "wrong"}
+        )
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.get_json()["error"]["code"], "UNAUTHORIZED")
+
+    def test_health_and_openapi_stay_public(self):
+        self.assertEqual(self.client.get("/api/v1/health").status_code, 200)
+        self.assertEqual(
+            self.client.get("/api/v1/openapi.json").status_code, 200
+        )
+
+    def test_openapi_has_no_anonymous_alternative(self):
+        spec = self.client.get("/api/v1/openapi.json").get_json()
+        self.assertNotIn({}, spec["security"])
 
 
 class VahanxParserTests(unittest.TestCase):

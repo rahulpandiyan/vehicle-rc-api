@@ -1148,9 +1148,12 @@ INDEX_HTML = r"""<!doctype html>
       };
     }
     if (statusCode === 429) {
+      const code = data.error?.code;
       return {
         title: "Too many lookups",
-        message: "VahanX is rate-limiting requests right now. Wait about 30 seconds and try again."
+        message: code === "RATE_LIMITED"
+          ? "You are searching too fast. Wait a few seconds and try again."
+          : "VahanX is limiting lookups from this server. Wait a minute or two and try again."
       };
     }
     if (statusCode === 502) {
@@ -1186,7 +1189,8 @@ INDEX_HTML = r"""<!doctype html>
     announce(`Reading RC record for ${number}.`);
 
     try {
-      const url = `/vehicle?key=${encodeURIComponent(API_KEY)}&query=${encodeURIComponent(number)}`;
+      const keyParam = API_KEY ? `&key=${encodeURIComponent(API_KEY)}` : "";
+      const url = `/vehicle?query=${encodeURIComponent(number)}${keyParam}`;
       const response = await fetch(url, {
         headers: { Accept: "application/json" },
         signal: activeController.signal

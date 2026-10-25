@@ -6,10 +6,9 @@ Web UI:      GET  /
 Single:      GET  /api/v1/vehicle/<registration>
              GET  /api/v1/vehicle?registration=MH12AB1234
              POST /api/v1/vehicle        {"registration": "MH12AB1234"}
-Batch:       POST /api/v1/vehicles/batch {"registrations": ["...", "..."]}
 Health:      GET  /api/v1/health
 OpenAPI:     GET  /api/v1/openapi.json
-Legacy:      GET  /vehicle?key=...&query=...   (flat response, used by the UI)
+Legacy:      GET  /vehicle?query=...            (flat response, used by the UI)
 """
 
 import hmac
@@ -19,7 +18,6 @@ import re
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 import requests
@@ -33,12 +31,29 @@ from frontend import INDEX_HTML
 # ---------------------------------------------------------------------------
 API_VERSION = "1.0.0"
 
-DEFAULT_API_KEY = os.environ.get("API_KEY", "Vehicle-key_s0undw4v3")
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# API keys are optional. VahanX itself needs no key; this is only an optional
+# gate for deployments that want to restrict who can call the wrapper.
 _api_keys_env = os.environ.get("API_KEYS", "")
+_api_key_env = os.environ.get("API_KEY", "")
 if _api_keys_env:
     VALID_API_KEYS = {k.strip() for k in _api_keys_env.split(",") if k.strip()}
+elif _api_key_env:
+    VALID_API_KEYS = {_api_key_env.strip()}
 else:
-    VALID_API_KEYS = {DEFAULT_API_KEY}
+    VALID_API_KEYS = set()
+
+# Open by default. Setting API_KEY / API_KEYS turns protection on; it can also
+# be forced on or off explicitly with REQUIRE_API_KEY=1/0.
+AUTH_REQUIRED = _env_flag("REQUIRE_API_KEY", default=bool(VALID_API_KEYS))
+UI_API_KEY = _api_key_env.strip() or next(iter(VALID_API_KEYS), "")
 
 # VahanX configuration (free, no provider API key required)
 VAHANX_BASE = os.environ.get("VAHANX_BASE", "https://vahanx.in").rstrip("/")
@@ -52,11 +67,11 @@ LOOKUP_WAIT = VAHANX_TIMEOUT * 2 + 5
 # Requests allowed per client IP per window. Set RATE_LIMIT=0 to disable.
 RATE_LIMIT = int(os.environ.get("RATE_LIMIT", "120"))
 RATE_WINDOW = int(os.environ.get("RATE_WINDOW", "60"))
-BATCH_MAX = int(os.environ.get("BATCH_MAX", "10"))
 
 VAHANX_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-IN,en;q=0.9",
+    "Referer": "https://vahanx.in/rc-search",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
 }
@@ -98,6 +113,18 @@ class VahanxUnavailable(RuntimeError):
 
 class VahanxRateLimited(RuntimeError):
     """Raised when VahanX itself rate-limits the lookup."""
+
+    def __init__(self, message: str, retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def _retry_after_value(exc, default: int = 60) -> str:
+    """Use VahanX's Retry-After when present, otherwise a safe default."""
+    try:
+        return str(max(1, int(float(exc.retry_after))))
+    except (TypeError, ValueError, AttributeError):
+        return str(default)
 
 
 # ---------------------------------------------------------------------------
@@ -311,7 +338,10 @@ def _vahanx_session_token(sess: requests.Session, force: bool = False) -> str:
 
     resp = sess.get(f"{VAHANX_BASE}/rc-search", timeout=VAHANX_TIMEOUT)
     if resp.status_code == 429:
-        raise VahanxRateLimited("VahanX rate limit reached, try again later")
+        raise VahanxRateLimited(
+            "VahanX rate limit reached, try again later",
+            retry_after=resp.headers.get("Retry-After"),
+        )
     if resp.status_code != 200:
         raise VahanxUnavailable(
             f"VahanX returned HTTP {resp.status_code} while creating a session"
@@ -429,7 +459,10 @@ def vahanx_lookup(number: str) -> dict:
             continue
 
         if resp.status_code == 429:
-            raise VahanxRateLimited("VahanX rate limit reached, try again later")
+            raise VahanxRateLimited(
+                "VahanX rate limit reached, try again later",
+                retry_after=resp.headers.get("Retry-After"),
+            )
         if resp.status_code != 200:
             last_error = VahanxUnavailable(f"VahanX returned HTTP {resp.status_code}")
             _local.vahanx_sess = None
@@ -504,6 +537,9 @@ def lookup(number: str, use_cache: bool = True):
 # Auth
 # ---------------------------------------------------------------------------
 def is_authorized() -> bool:
+    if not AUTH_REQUIRED:
+        return True
+
     provided_key = request.args.get("key") or request.args.get("api_key")
 
     if not provided_key:
@@ -634,7 +670,7 @@ def _error_from_exception(exc: Exception, norm: str):
             429, "UPSTREAM_RATE_LIMITED",
             "The upstream data source is rate-limiting requests. Try again shortly.",
         )
-        response.headers["Retry-After"] = "30"
+        response.headers["Retry-After"] = _retry_after_value(exc)
         return response
     return _v1_error(
         502, "UPSTREAM_UNAVAILABLE",
@@ -666,66 +702,15 @@ def _v1_lookup_response(number: str, use_cache: bool):
     })
 
 
-def _batch_item(number: str, request_id: str) -> dict:
-    started = time.perf_counter()
-    norm = normalize_number(str(number or ""))
-    if not is_valid_number(norm):
-        return {
-            "registration_number": norm or str(number or ""),
-            "status": "error",
-            "found": False,
-            "error": {
-                "code": "INVALID_REGISTRATION",
-                "message": f"'{number}' is not a valid Indian registration number.",
-            },
-        }
-    try:
-        result, cached = lookup(norm)
-    except VehicleNotFound as exc:
-        return {
-            "registration_number": norm,
-            "status": "error",
-            "found": False,
-            "error": {"code": "VEHICLE_NOT_FOUND", "message": str(exc)},
-        }
-    except VahanxRateLimited:
-        return {
-            "registration_number": norm,
-            "status": "error",
-            "found": False,
-            "error": {
-                "code": "UPSTREAM_RATE_LIMITED",
-                "message": "The upstream data source is rate-limiting requests.",
-            },
-        }
-    except Exception as exc:  # noqa: BLE001
-        app.logger.warning("VahanX lookup failed for %s: %s", norm, exc)
-        return {
-            "registration_number": norm,
-            "status": "error",
-            "found": False,
-            "error": {
-                "code": "UPSTREAM_UNAVAILABLE",
-                "message": "The upstream data source is unavailable right now.",
-            },
-        }
-
-    elapsed_ms = int((time.perf_counter() - started) * 1000)
-    return {
-        "registration_number": norm,
-        "status": "success",
-        "found": True,
-        "data": public_vehicle(result),
-        "meta": _meta(result, cached, elapsed_ms, request_id),
-    }
-
-
 def _openapi_spec() -> dict:
     lookup_security = [
         {"ApiKeyAuth": []},
         {"BearerAuth": []},
         {"QueryKey": []},
     ]
+    if not AUTH_REQUIRED:
+        # An empty requirement means the endpoint can be called without a key.
+        lookup_security.append({})
     vehicle_schema = {
         "type": "object",
         "properties": {
@@ -845,7 +830,9 @@ def _openapi_spec() -> dict:
             "version": API_VERSION,
             "description": (
                 "Indian vehicle Registration Certificate lookup backed by VahanX. "
-                "Send the API key as X-API-KEY, a Bearer token, or a ?key= query parameter."
+                "No API key is required by default. If the deployment enables "
+                "protection, send the key as X-API-KEY, a Bearer token, or a "
+                "?key= query parameter."
             ),
         },
         "servers": [{"url": "/"}],
@@ -865,30 +852,6 @@ def _openapi_spec() -> dict:
                 "Meta": meta_schema,
                 "Error": error_schema,
                 "LookupSuccess": success_schema,
-                "BatchItem": {
-                    "type": "object",
-                    "properties": {
-                        "registration_number": {"type": "string"},
-                        "status": {"type": "string", "enum": ["success", "error"]},
-                        "found": {"type": "boolean"},
-                        "data": {"$ref": "#/components/schemas/Vehicle"},
-                        "meta": {"$ref": "#/components/schemas/Meta"},
-                        "error": {"type": "object"},
-                    },
-                },
-                "BatchResponse": {
-                    "type": "object",
-                    "properties": {
-                        "status": {"type": "string", "enum": ["success", "partial", "error"]},
-                        "count": {"type": "integer"},
-                        "succeeded": {"type": "integer"},
-                        "failed": {"type": "integer"},
-                        "results": {
-                            "type": "array",
-                            "items": {"$ref": "#/components/schemas/BatchItem"},
-                        },
-                    },
-                },
             },
         },
         "paths": {
@@ -952,41 +915,6 @@ def _openapi_spec() -> dict:
                     },
                     "responses": single_responses,
                 },
-            },
-            "/api/v1/vehicles/batch": {
-                "post": {
-                    "tags": ["Lookup"],
-                    "summary": "Look up several vehicles in one request",
-                    "operationId": "postVehicleBatch",
-                    "requestBody": {
-                        "required": True,
-                        "content": {
-                            "application/json": {
-                                "schema": {
-                                    "type": "object",
-                                    "required": ["registrations"],
-                                    "properties": {
-                                        "registrations": {
-                                            "type": "array",
-                                            "items": {"type": "string"},
-                                            "maxItems": BATCH_MAX,
-                                            "example": ["MH12AB1234", "DL01AB1234"],
-                                        }
-                                    },
-                                }
-                            }
-                        },
-                    },
-                    "responses": {
-                        "200": {
-                            "description": "Per-item results. Check each item's status.",
-                            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/BatchResponse"}}},
-                        },
-                        "400": {"description": "Invalid batch request.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}},
-                        "401": {"description": "Missing or invalid API key.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}},
-                        "429": {"description": "Rate limited.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}},
-                    },
-                }
             },
             "/api/v1/health": {
                 "get": {
@@ -1100,7 +1028,7 @@ def _reject_if_unauthorized():
 @app.route("/", methods=["GET"])
 def home():
     page = INDEX_HTML.replace(
-        "__API_KEY__", html_lib.escape(DEFAULT_API_KEY, quote=True)
+        "__API_KEY__", html_lib.escape(UI_API_KEY, quote=True)
     )
     return Response(page, mimetype="text/html")
 
@@ -1129,14 +1057,14 @@ def index():
         "name": "Vehicle RC API",
         "version": API_VERSION,
         "provider": "vahanx",
+        "auth_required": AUTH_REQUIRED,
         "ui": "/",
         "openapi": "/api/v1/openapi.json",
         "endpoints": {
             "single": "/api/v1/vehicle/{registration}",
             "query": "/api/v1/vehicle?registration={registration}",
-            "batch": "/api/v1/vehicles/batch",
             "health": "/api/v1/health",
-            "legacy": "/vehicle?key={api_key}&query={registration}",
+            "legacy": "/vehicle?query={registration}",
         },
     }), 200
 
@@ -1173,8 +1101,7 @@ def vehicle_info():
             "status": "error",
             "error": "Missing search term",
             "message": (
-                "Missing 'query' parameter. Usage: "
-                "/vehicle?key={api_key}&query={vehicle_number}"
+                "Missing 'query' parameter. Usage: /vehicle?query={vehicle_number}"
             ),
         }), 400
 
@@ -1208,7 +1135,7 @@ def vehicle_info():
             "message": str(exc),
         })
         response.status_code = 429
-        response.headers["Retry-After"] = "30"
+        response.headers["Retry-After"] = _retry_after_value(exc)
         return response
     except Exception as exc:
         app.logger.warning("VahanX lookup failed for %s: %s", norm, exc)
@@ -1248,10 +1175,10 @@ def v1_health():
         "data": {
             "provider": "vahanx",
             "version": API_VERSION,
+            "auth_required": AUTH_REQUIRED,
             "cache_entries": len(_cache),
             "uptime_s": int(time.time() - _boot),
             "rate_limit_per_minute": RATE_LIMIT,
-            "batch_max": BATCH_MAX,
         },
         "meta": {"request_id": _request_id()},
     })
@@ -1294,66 +1221,6 @@ def v1_vehicle():
             "or the path /api/v1/vehicle/<registration>.",
         )
     return _v1_lookup_response(number, _extract_use_cache(payload))
-
-
-@app.route("/api/v1/vehicles/batch", methods=["POST", "OPTIONS"])
-def v1_vehicle_batch():
-    if request.method == "OPTIONS":
-        return "", 204
-
-    limited = _reject_if_limited()
-    if limited is not None:
-        return limited
-    unauthorized = _reject_if_unauthorized()
-    if unauthorized is not None:
-        return unauthorized
-
-    body = request.get_json(silent=True)
-    if not isinstance(body, dict):
-        return _v1_error(
-            400, "INVALID_BODY",
-            "Send a JSON object such as "
-            '{"registrations": ["MH12AB1234", "DL01AB1234"]}.',
-        )
-
-    registrations = (
-        body.get("registrations")
-        or body.get("queries")
-        or body.get("numbers")
-    )
-    if isinstance(registrations, str):
-        registrations = [registrations]
-    if not isinstance(registrations, list) or not registrations:
-        return _v1_error(
-            400, "MISSING_REGISTRATIONS",
-            "The 'registrations' field must be a non-empty array.",
-        )
-    if len(registrations) > BATCH_MAX:
-        return _v1_error(
-            400, "BATCH_TOO_LARGE",
-            f"At most {BATCH_MAX} registrations can be looked up per request.",
-            max_items=BATCH_MAX,
-            received=len(registrations),
-        )
-
-    workers = min(5, len(registrations))
-    request_id = _request_id()
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        results = list(
-            pool.map(lambda plate: _batch_item(plate, request_id), registrations)
-        )
-
-    succeeded = sum(1 for item in results if item["status"] == "success")
-    failed = len(results) - succeeded
-    overall = "success" if failed == 0 else ("partial" if succeeded else "error")
-
-    return jsonify({
-        "status": overall,
-        "count": len(results),
-        "succeeded": succeeded,
-        "failed": failed,
-        "results": results,
-    })
 
 
 if __name__ == "__main__":
