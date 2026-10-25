@@ -1027,6 +1027,26 @@ def _reject_if_unauthorized():
 # ---------------------------------------------------------------------------
 @app.route("/", methods=["GET"])
 def home():
+    if request.args.get("__diag") == "1":
+        keys = (
+            "PATH_INFO", "SCRIPT_NAME", "QUERY_STRING", "REQUEST_URI",
+            "RAW_URI", "HTTP_X_MATCHED_PATH", "HTTP_X_FORWARDED_URI",
+            "HTTP_X_FORWARDED_PATH", "HTTP_X_ORIGINAL_URI",
+            "HTTP_X_VERCEL_ORIGINAL_PATH", "HTTP_X_REWRITE_URL",
+            "HTTP_HOST", "SERVER_NAME",
+        )
+        environ = {k: request.environ.get(k) for k in keys}
+        environ.update({
+            k: v for k, v in request.environ.items()
+            if k.startswith("HTTP_X_VERCEL") or k.startswith("HTTP_X_FORWARDED")
+        })
+        return jsonify({
+            "path": request.path,
+            "full_path": request.full_path,
+            "url": request.url,
+            "environ": environ,
+        })
+
     page = INDEX_HTML.replace(
         "__API_KEY__", html_lib.escape(UI_API_KEY, quote=True)
     )
