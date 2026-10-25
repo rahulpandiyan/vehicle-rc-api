@@ -449,7 +449,7 @@ vehicle-rc-api/
 ├── Vehicle.py          # Flask app, VahanX client, v1 API, OpenAPI spec
 ├── frontend.py         # Bundled web UI (INDEX_HTML)
 ├── api/index.py        # Vercel serverless entrypoint
-├── vercel.json         # Rewrites all routes to the function
+├── vercel.json         # Rewrites app routes to the function, keeping the path
 ├── requirements.txt
 ├── tests/
 │   └── test_vehicle.py # Offline tests (network mocked)
